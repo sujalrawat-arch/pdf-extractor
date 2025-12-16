@@ -44,6 +44,24 @@ def get_rows_columns_map(table_block: dict, blocks_map: Dict[str, dict]) -> Dict
     return rows
 
 
+def _collect_blocks(textract_json: dict) -> List[dict]:
+    """Normalize Textract output regardless of nesting shape."""
+    blocks: List[dict] = []
+
+    if textract_json.get("pages"):
+        for idx, page in enumerate(textract_json.get("pages", []), start=1):
+            page_num = int(page.get("Page", page.get("page", idx)) or idx)
+            for b in page.get("Blocks", []) or []:
+                b = dict(b)
+                if "Page" not in b:
+                    b["Page"] = page_num
+                blocks.append(b)
+    elif textract_json.get("Blocks"):
+        blocks.extend(textract_json.get("Blocks", []) or [])
+
+    return blocks
+
+
 def _rows_to_grid(rows: Dict[int, Dict[int, str]]) -> List[List[str]]:
     """Flattens the dictionary map into a standard 2D list (grid)."""
     if not rows:
@@ -297,11 +315,9 @@ def process_aws_results_smart(blocks: List[dict]) -> List[dict]:
 
 def step_07_unify(ctx, log):
     textract_json = read_json(ctx.textract_raw_json, {}) or {}
-    
-    # 1. Flatten all blocks (handles multipage Textract JSON)
-    blocks = []
-    for p in textract_json.get("pages", []) or []:
-        blocks.extend(p.get("Blocks", []) or [])
+
+    # 1. Flatten all blocks (handles multipage Textract JSON and flat `Blocks`)
+    blocks = _collect_blocks(textract_json)
 
     # 2. Process Text & Tables (Using the Efficient Logic)
     processed_items = process_aws_results_smart(blocks)

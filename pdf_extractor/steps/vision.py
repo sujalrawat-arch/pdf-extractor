@@ -19,23 +19,37 @@ from ..config import OPENAI_API_KEY
 from ..utils import write_json, read_json
 
 
+def _group_blocks_by_page(textract_data: dict) -> Dict[int, List[dict]]:
+    """Normalize Textract output that may be either nested under `pages` or flat `Blocks`."""
+    pages: Dict[int, List[dict]] = {}
+
+    if textract_data.get("pages"):
+        for idx, page in enumerate(textract_data.get("pages", []), start=1):
+            # Textract may not place a Page number at the page node; default to its index.
+            page_num = int(page.get("Page", page.get("page", idx)) or idx)
+            for block in page.get("Blocks", []) or []:
+                b_page = int(block.get("Page", page_num) or page_num)
+                pages.setdefault(b_page, []).append(block)
+    elif textract_data.get("Blocks"):
+        for block in textract_data.get("Blocks", []) or []:
+            b_page = int(block.get("Page", 1) or 1)
+            pages.setdefault(b_page, []).append(block)
+
+    return pages
+
+
 def _encode_image_bytes(img_bytes: bytes) -> str:
     """Encodes raw image bytes to base64 string."""
     # CHANGED: Use PNG MIME type instead of WEBP
     return f"data:image/png;base64,{base64.b64encode(img_bytes).decode('utf-8')}"
 
 
-def _get_figure_blocks(textract_data: dict, page_num: int) -> List[dict]:
-    """
-    Extracts FIGURE, DIAGRAM, or LAYOUT_FIGURE blocks for a specific page.
-    Returns a list of blocks with their Geometry (BoundingBox).
-    """
+def _get_figure_blocks(blocks_by_page: Dict[int, List[dict]], page_num: int) -> List[dict]:
+    """Extract FIGURE/DIAGRAM blocks already grouped by page."""
     figures = []
-    for page in textract_data.get("pages", []):
-        for block in page.get("Blocks", []):
-            if block.get("BlockType") in ["FIGURE", "DIAGRAM", "LAYOUT_FIGURE"]:
-                if int(block.get("Page", 1)) == page_num:
-                    figures.append(block)
+    for block in blocks_by_page.get(page_num, []):
+        if block.get("BlockType") in ["FIGURE", "DIAGRAM", "LAYOUT_FIGURE"]:
+            figures.append(block)
     return figures
 
 
@@ -152,6 +166,8 @@ def step_06_vision_async(ctx, log):
         async_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         semaphore = asyncio.Semaphore(min(5, (os.cpu_count() or 4)))
 
+        blocks_by_page = _group_blocks_by_page(textract_json)
+
         # Clear any prior figure crops so the folder only contains the current run.
         os.makedirs(ctx.vision_dir, exist_ok=True)
         for name in os.listdir(ctx.vision_dir):
@@ -171,7 +187,22 @@ def step_06_vision_async(ctx, log):
         total_figures = 0
         
         for page_num in pages_to_scan:
-            fig_blocks = _get_figure_blocks(textract_json, page_num)
+            page_blocks = blocks_by_page.get(page_num, [])
+            page_text = " ".join(
+                b.get("Text", "") for b in page_blocks if b.get("BlockType") == "LINE"
+            ).lower()
+
+            fig_blocks = _get_figure_blocks(blocks_by_page, page_num)
+
+            # Fallback: if no figure blocks but page mentions a flow chart, send full page to vision.
+            if not fig_blocks and any(k in page_text for k in ("flow chart", "flowchart", "process flow")):
+                fig_blocks = [
+                    {
+                        "BlockType": "FLOWCHART_FALLBACK",
+                        "Geometry": {"BoundingBox": {"Left": 0.0, "Top": 0.0, "Width": 1.0, "Height": 1.0}},
+                        "Id": f"flowchart_page_{page_num}",
+                    }
+                ]
             
             # Filter to likely charts/flows; drop logos/icons.
             fig_blocks = [b for b in fig_blocks if _is_relevant_figure_block(b)]
@@ -184,14 +215,14 @@ def step_06_vision_async(ctx, log):
             w, h = page_obj.rect.width, page_obj.rect.height
 
             for block in fig_blocks:
-                bbox = block["Geometry"]["BoundingBox"]
+                bbox = (block.get("Geometry", {}) or {}).get("BoundingBox", {}) or {}
                 
                 # Convert normalized bbox to PDF coordinates
                 rect = fitz.Rect(
-                    bbox["Left"] * w, 
-                    bbox["Top"] * h, 
-                    (bbox["Left"] + bbox["Width"]) * w, 
-                    (bbox["Top"] + bbox["Height"]) * h
+                    bbox.get("Left", 0.0) * w,
+                    bbox.get("Top", 0.0) * h,
+                    (bbox.get("Left", 0.0) + bbox.get("Width", 1.0)) * w,
+                    (bbox.get("Top", 0.0) + bbox.get("Height", 1.0)) * h
                 )
                 
                 pix = page_obj.get_pixmap(clip=rect, dpi=200, colorspace=fitz.csRGB)
@@ -207,8 +238,8 @@ def step_06_vision_async(ctx, log):
                 
                 meta = {
                     "page": page_num,
-                    "bbox": bbox["Top"],
-                    "id": block["Id"],
+                    "bbox": float(bbox.get("Top", 0.0)),
+                    "id": block.get("Id"),
                     "image_path": img_path,
                 }
                 
